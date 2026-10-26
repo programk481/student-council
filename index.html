@@ -2088,7 +2088,7 @@
                             <h3 class="text-xs font-bold text-slate-700"><i class="fa-solid fa-chart-pie mr-1.5"></i> 나의 활동 대시보드 (지도 출석 1회당 1시간)</h3>
                             <div class="grid grid-cols-2 gap-3 text-center pt-1">
                                 <div class="bg-slate-50 p-3 rounded-xl border border-slate-100">
-                                    <span class="text-[11px] text-slate-500 block font-semibold">지도 출석</span>
+                                    <span class="text-[11px] text-slate-500 block font-semibold">지도 출석(1회=1시간)</span>
                                     <span id="dash-crack" class="text-lg font-bold text-indigo-600">0회</span>
                                 </div>
                                 <div class="bg-slate-50 p-3 rounded-xl border border-slate-100">
@@ -2245,6 +2245,11 @@
                             </div>
                             <div class="space-y-2">
                                 <div>
+                                    <label class="block text-[11px] font-semibold text-slate-600 mb-1">표시 이름 (본인이 수정 가능)</label>
+                                    <input id="settings-name" maxlength="20" value="${escapeHtml(dbCache.currentUser.name||'')}" class="w-full bg-slate-50 border border-slate-200 px-3 py-2 rounded-xl font-bold" placeholder="새 이름">
+                                    <p class="text-[10px] text-amber-700 mt-1">이름 변경 후에도 로그인할 때 입력하는 기존 이름은 그대로 사용합니다. 출석·지도 기록에는 새 이름이 적용됩니다.</p>
+                                </div>
+                                <div>
                                     <label class="block text-[11px] font-semibold text-slate-600 mb-1">학년</label>
                                     <select id="settings-grade" class="w-full bg-slate-50 border border-slate-200 px-3 py-2 rounded-xl font-bold">
                                         <option value="1학년" ${dbCache.currentUser.grade==='1학년'?'selected':''}>1학년</option>
@@ -2355,42 +2360,75 @@
                 const preview=document.getElementById('my-profile-preview');if(preview)preview.src=data;showAlert('프로필 사진을 저장했습니다.');
             }catch(e){showAlert('사진 저장 실패: '+(e?.message||e));}
         }
-        async function updateUserProfile() {
-            const grade = document.getElementById('settings-grade').value;
-            const cls = document.getElementById('settings-class').value;
-            const num = document.getElementById('settings-number').value;
-
-            dbCache.currentUser.grade = grade;
-            dbCache.currentUser.class = cls;
-            dbCache.currentUser.number = num;
-
-            const idx = dbCache.users.findIndex(u => u.name === dbCache.currentUser.name);
-            if (idx !== -1) {
-                dbCache.users[idx] = dbCache.currentUser;
-            }
-
-            saveLocalCache();
-
-            const sb = requireSupabase();
-            if (sb && dbCache.currentUser.id) {
-                const { error } = await sb.from('users').update({
-                    grade,
-                    class: cls,
-                    number: num
-                }).eq('id', dbCache.currentUser.id);
-
-                if (error) {
-                    console.error('프로필 수정 실패:', error);
-                    showAlert('내 정보 저장에 실패했습니다.');
-                    return;
+        // 이름은 로그인 ID와 구분합니다. 서버 인증용 이메일은 변경하지 않습니다.
+        // 학생 본인의 정보만 수정하며, 연결된 지도/출석/대체근무/회의 기록의 이름을 함께 이전합니다.
+        function renameCouncilReferences(items, oldName, newName){
+            const renameKeys=new Set(['memberName','user','acceptedBy','author','editor','statusEditedBy','requestedBy','approvedBy']);
+            function walk(value, key=''){
+                if(Array.isArray(value))return value.map(x=>typeof x==='string'&&x===oldName&&key==='targets'?newName:walk(x,key));
+                if(value&&typeof value==='object'){
+                    const out={};
+                    for(const [k,v] of Object.entries(value)){
+                        const nextKey=['rsvps','rsvpReasons','votes'].includes(key)&&k===oldName?newName:k;
+                        out[nextKey]=typeof v==='string'&&v===oldName&&renameKeys.has(k)?newName:walk(v,k);
+                    }
+                    return out;
                 }
+                return value;
             }
-
+            return walk(items);
+        }
+        async function updateUserProfile() {
+            if(!navigator.onLine)return showAlert('개인정보 수정은 인터넷 연결 후 가능합니다.');
+            const grade=document.getElementById('settings-grade').value;
+            const cls=document.getElementById('settings-class').value;
+            const num=document.getElementById('settings-number').value;
+            const newName=document.getElementById('settings-name').value.trim().replace(/\s+/g,' ');
+            const oldName=dbCache.currentUser.name;
+            if(!/^[가-힣A-Za-z0-9 _-]{2,20}$/.test(newName))return showAlert('이름은 2~20자, 한글/영문/숫자/공백만 사용할 수 있습니다.');
+            const sb=requireSupabase();if(!sb)return;
             const org=dbCache.orgs.find(o=>o.code===dbCache.currentOrgCode);
-            const mem=org?.members?.find(m=>m.name===dbCache.currentUser.name);
-            if(mem){mem.grade=grade;mem.class=cls;mem.number=num;await syncOrgToFirestore(org);}
-            showAlert('내 정보가 성공적으로 수정되었습니다.');
-            showMainApp();
+            if(!org)return showAlert('소속 조직을 찾을 수 없습니다.');
+            const originalMember=org.members.find(m=>m.name===oldName);
+            if(!originalMember)return showAlert('현재 조직에서 본인의 회원 정보를 찾을 수 없습니다.');
+            try{
+                if(newName!==oldName){
+                    if(org.members.some(m=>m.name===newName))return showAlert('조직에 같은 이름을 사용하는 회원이 있습니다.');
+                    const {data:existing,error:checkError}=await sb.from('users').select('id').eq('name',newName).limit(1);
+                    if(checkError)throw checkError;
+                    if((existing||[]).some(u=>u.id!==dbCache.currentUser.id))return showAlert('이미 다른 회원이 사용 중인 이름입니다.');
+                    // 이름을 바꿀 때 기록의 이름 키도 옮겨서 누적 출석과 시간이 유지됩니다.
+                    const types=[['duties','duties'],['swaps','swaps'],['guide_attendance','guideAttendance'],['meetings','meetings'],['notices','notices'],['polls','polls'],['manual','manuals'],['manual_requests','manualRequests']];
+                    for(const [type,cacheKey] of types){
+                        const before=dbCache[cacheKey][dbCache.currentOrgCode]||[];
+                        const after=renameCouncilReferences(before,oldName,newName);
+                        if(JSON.stringify(before)===JSON.stringify(after))continue;
+                        const ok=await syncSubColToFirestore(type,dbCache.currentOrgCode,after);
+                        if(!ok)throw new Error(`${type} 기록 이전 실패`);
+                    }
+                    const nextOrg=structuredClone(org);
+                    const m=nextOrg.members.find(m=>m.name===oldName);
+                    m.name=newName;m.grade=grade;m.class=cls;m.number=num;
+                    const orgOk=await syncOrgToFirestore(nextOrg);
+                    if(!orgOk)throw new Error('조직 회원 이름 저장 실패');
+                }else{
+                    const nextOrg=structuredClone(org);
+                    const m=nextOrg.members.find(m=>m.name===oldName);
+                    m.grade=grade;m.class=cls;m.number=num;
+                    if(!await syncOrgToFirestore(nextOrg))throw new Error('조직 내 학적 정보 저장 실패');
+                }
+                const {error}=await sb.from('users').update({name:newName,grade,class:cls,number:num}).eq('id',dbCache.currentUser.id);
+                if(error)throw error;
+                dbCache.currentUser={...dbCache.currentUser,name:newName,grade,class:cls,number:num};
+                saveLocalCache();
+                await loadAllFromSupabase();
+                showMainApp();
+                showAlert(newName!==oldName?'이름과 연결된 활동 기록을 변경했습니다. 로그인할 때는 기존 이름을 사용하세요.':'내 정보가 수정되었습니다.');
+            }catch(e){
+                console.error('프로필 변경 오류',e);
+                await loadAllFromSupabase();
+                showAlert('정보 저장에 실패했습니다: '+(e?.message||e)+'\n이름 변경이 중간에 중단되었다면 관리자에게 알려주세요.');
+            }
         }
 
         function openWithdrawModal() {
@@ -3890,7 +3928,7 @@
             const list=meetings||(dbCache.meetings[dbCache.currentOrgCode]||[]).filter(x=>x.scope==='department'&&x.departmentId===key);
             if(!list.length){el.innerHTML='<div class="text-xs text-slate-400 bg-white border rounded-2xl p-4">소집된 부서 회의가 없습니다.</div>';return;}
             const admin=currentUserIsAdmin();
-            el.innerHTML=list.map(m=>{const target=(m.targets||[]).includes(dbCache.currentUser.name),my=m.rsvps?.[dbCache.currentUser.name];const reports=Object.entries(m.rsvps||{}).map(([n,st])=>`<div class="flex justify-between border-t py-1"><span><b>${n}</b> · ${st}</span><span>${st==='불참'?(m.rsvpReasons?.[n]||''):''}</span></div>`).join('');return `<div class="bg-white border rounded-2xl p-4 text-xs space-y-2 mb-2"><div class="flex justify-between gap-2"><div><b class="text-sm">${m.title}</b><div class="text-slate-400 mt-1">${m.time?.replace('T',' ')||''} · ${m.loc||''}</div></div>${canManageDepartmentContent(key)?`<button onclick="runBusyAction(this,'회의 삭제 중...',()=>deleteMeeting(${m.id}))" class="text-rose-600 font-bold">삭제</button>`:''}</div>${m.details?`<p class="bg-slate-50 p-2 rounded-lg whitespace-pre-line">${m.details}</p>`:''}${target?`<div class="grid grid-cols-2 gap-2"><button onclick="runBusyAction(this,'참석 저장 중...',()=>handleRSVP(${m.id},'참석'))" class="py-2 rounded-xl font-bold ${my==='참석'?'bg-emerald-600 text-white':'bg-slate-100'}">참석</button><button onclick="runBusyAction(this,'불참 저장 중...',()=>handleRSVP(${m.id},'불참'))" class="py-2 rounded-xl font-bold ${my==='불참'?'bg-rose-600 text-white':'bg-slate-100'}">불참</button></div>`:`<div class="bg-slate-50 p-2 rounded-lg text-slate-500">열람만 가능 · 소집 대상 아님</div>`}${admin?`<div class="bg-slate-50 p-2 rounded-xl"><b>응답 현황</b>${reports||'<p>아직 응답 없음</p>'}</div>`:''}</div>`}).join('');
+            el.innerHTML=list.map(m=>{const target=(m.targets||[]).includes(dbCache.currentUser.name),my=m.rsvps?.[dbCache.currentUser.name];const reports=Object.entries(m.rsvps||{}).map(([n,st])=>`<div class="flex justify-between border-t py-1"><span><b>${n}</b> · ${st}</span><span>${st==='불참'?(m.rsvpReasons?.[n]||''):''}</span></div>`).join('');return `<div class="bg-white border rounded-2xl p-4 text-xs space-y-2 mb-2"><div class="flex justify-between gap-2"><div><b class="text-sm">${m.title}</b><div class="text-slate-400 mt-1">${m.time?.replace('T',' ')||''} · ${m.loc||''}</div></div>${canManageDepartmentContent(key)?`<div class="flex gap-2">${currentUserIsAdmin()?`<button onclick="runBusyAction(this,'회의 종료 중...',()=>finishMeeting(${m.id}))" class="text-emerald-700 font-bold">회의 종료</button>`:''}<button onclick="runBusyAction(this,'회의 삭제 중...',()=>deleteMeeting(${m.id}))" class="text-rose-600 font-bold">삭제</button></div>`:''}</div>${m.details?`<p class="bg-slate-50 p-2 rounded-lg whitespace-pre-line">${m.details}</p>`:''}${target?`<div class="grid grid-cols-2 gap-2"><button onclick="runBusyAction(this,'참석 저장 중...',()=>handleRSVP(${m.id},'참석'))" class="py-2 rounded-xl font-bold ${my==='참석'?'bg-emerald-600 text-white':'bg-slate-100'}">참석</button><button onclick="runBusyAction(this,'불참 저장 중...',()=>handleRSVP(${m.id},'불참'))" class="py-2 rounded-xl font-bold ${my==='불참'?'bg-rose-600 text-white':'bg-slate-100'}">불참</button></div>`:`<div class="bg-slate-50 p-2 rounded-lg text-slate-500">열람만 가능 · 소집 대상 아님</div>`}${admin?`<div class="bg-slate-50 p-2 rounded-xl"><b>응답 현황</b>${reports||'<p>아직 응답 없음</p>'}</div>`:''}</div>`}).join('');
         }
 
         function openDepartmentNotice(key){if(!canPostDepartment(key))return showAlert('이 부서에서 공지를 작성할 권한이 없습니다.');noticeComposerContext={departmentId:key,departmentName:departmentDisplayName(key),targets:departmentAudience(key).map(m=>m.name)};document.getElementById('notice-title').value='';document.getElementById('notice-content').value='';const h=document.querySelector('#notice-modal h3');if(h)h.textContent=`${departmentDisplayName(key)} 공지 등록`;openModal('notice-modal');}
@@ -4271,9 +4309,24 @@
             }
         }
 
+        async function finishMeeting(id){
+            if(!currentUserIsAdmin())return showAlert('관리자만 회의를 종료할 수 있습니다.');
+            const m=(dbCache.meetings[dbCache.currentOrgCode]||[]).find(x=>String(x.id)===String(id));
+            if(!m)return showAlert('회의를 찾을 수 없습니다.');
+            if(!confirm(`「${m.title}」 회의를 완료하고 목록에서 삭제할까요?\n완료 후에는 참석 응답과 회의 내용을 복구할 수 없습니다.`))return;
+            if(!navigator.onLine)return showAlert('회의 종료는 인터넷 연결 후 가능합니다.');
+            const sb=requireSupabase();if(!sb)return;
+            const {error}=await sb.rpc('finish_council_meeting',{p_org_code:dbCache.currentOrgCode,p_meeting_id:String(id)});
+            if(error)return showAlert('회의 종료 실패: '+error.message);
+            await loadAllFromSupabase();
+            if(currentTab==='departments')renderDepartmentHub();
+            else renderMeetingList();
+            updateHomeDashboardData();
+            showAlert('회의가 완료되어 목록에서 삭제되었습니다.');
+        }
         async function deleteMeeting(id){const item=(dbCache.meetings[dbCache.currentOrgCode]||[]).find(x=>x.id===id);if(!item)return;if(item.scope==='department'&&!canManageDepartmentContent(item.departmentId))return showAlert('삭제 권한이 없습니다.');if(item.scope!=='department'&&!currentUserIsAdmin())return showAlert('관리자만 삭제할 수 있습니다.');if(!confirm('이 회의를 삭제하시겠습니까?'))return;dbCache.meetings[dbCache.currentOrgCode]=(dbCache.meetings[dbCache.currentOrgCode]||[]).filter(x=>x.id!==id);await syncSubColToFirestore('meetings',dbCache.currentOrgCode,dbCache.meetings[dbCache.currentOrgCode]);if(currentTab==='departments')renderDepartmentHub();else renderMeetingList();}
         function handleRSVP(mid,status){const list=dbCache.meetings[dbCache.currentOrgCode]||[],m=list.find(x=>x.id===mid);if(!m)return;if(Array.isArray(m.targets)&&!m.targets.includes(dbCache.currentUser.name))return showAlert('소집 대상자가 아닙니다.');m.rsvps||={};m.rsvpReasons||={};if(status==='불참'){const reason=prompt('불참 사유를 입력해주세요.');if(reason===null)return;if(!reason.trim())return showAlert('사유를 입력해주세요.');m.rsvpReasons[dbCache.currentUser.name]=reason.trim()}else delete m.rsvpReasons[dbCache.currentUser.name];m.rsvps[dbCache.currentUser.name]=status;syncSubColToFirestore('meetings',dbCache.currentOrgCode,list);if(currentTab==='departments')renderDepartmentHub();else renderMeetingList();}
-        function renderMeetingList(){const el=document.getElementById('meeting-list'),list=(dbCache.meetings[dbCache.currentOrgCode]||[]).filter(x=>x.scope!=='department');if(!el)return;if(!list.length){el.innerHTML='<p class="text-center text-xs text-slate-400 py-8">소집된 회의가 없습니다.</p>';return}el.innerHTML=list.map(m=>{const target=!Array.isArray(m.targets)||m.targets.includes(dbCache.currentUser.name),my=m.rsvps?.[dbCache.currentUser.name],reports=Object.entries(m.rsvps||{}).map(([n,st])=>`<div class="flex justify-between border-t py-1"><span><b>${n}</b> · ${st}</span><span>${st==='불참'?(m.rsvpReasons?.[n]||''):''}</span></div>`).join('');return`<div class="bg-white p-4 rounded-2xl border shadow-sm space-y-2 text-xs"><div class="flex justify-between"><b class="text-sm">${m.title}</b><span>${m.loc}</span></div><p><b>회의 일시</b> ${m.time.replace('T',' ')}</p><div class="bg-indigo-50 text-indigo-700 px-2.5 py-2 rounded-xl font-bold">소집: ${meetingAudienceLabel(m)||'대상 미지정'}</div>${m.details?`<p class="bg-slate-50 p-2 rounded-lg whitespace-pre-line">${m.details}</p>`:''}${target?`<div class="grid grid-cols-2 gap-2"><button onclick="runBusyAction(this,'참석 저장 중...',()=>handleRSVP(${m.id},'참석'))" class="py-2 rounded-xl font-bold ${my==='참석'?'bg-emerald-600 text-white':'bg-slate-100'}">참석</button><button onclick="runBusyAction(this,'불참 저장 중...',()=>handleRSVP(${m.id},'불참'))" class="py-2 rounded-xl font-bold ${my==='불참'?'bg-rose-600 text-white':'bg-slate-100'}">불참</button></div>`:`<div class="bg-slate-50 p-2 rounded-lg text-slate-500">열람만 가능 · 참석/불참 응답 대상 아님</div>`}${currentUserIsAdmin()?`<div class="bg-slate-50 p-2 rounded-xl"><b>응답</b>${reports||'<p>아직 응답 없음</p>'}</div><div class="flex gap-2"><button onclick="openMeetingForEdit(${m.id})" class="flex-1 py-2 bg-indigo-50 text-indigo-600 rounded-xl font-bold">수정</button><button onclick="runBusyAction(this,'회의 삭제 중...',()=>deleteMeeting(${m.id}))" class="flex-1 py-2 bg-rose-50 text-rose-600 rounded-xl font-bold">삭제</button></div>`:''}</div>`}).join('');}
+        function renderMeetingList(){const el=document.getElementById('meeting-list'),list=(dbCache.meetings[dbCache.currentOrgCode]||[]).filter(x=>x.scope!=='department');if(!el)return;if(!list.length){el.innerHTML='<p class="text-center text-xs text-slate-400 py-8">소집된 회의가 없습니다.</p>';return}el.innerHTML=list.map(m=>{const target=!Array.isArray(m.targets)||m.targets.includes(dbCache.currentUser.name),my=m.rsvps?.[dbCache.currentUser.name],reports=Object.entries(m.rsvps||{}).map(([n,st])=>`<div class="flex justify-between border-t py-1"><span><b>${n}</b> · ${st}</span><span>${st==='불참'?(m.rsvpReasons?.[n]||''):''}</span></div>`).join('');return`<div class="bg-white p-4 rounded-2xl border shadow-sm space-y-2 text-xs"><div class="flex justify-between"><b class="text-sm">${m.title}</b><span>${m.loc}</span></div><p><b>회의 일시</b> ${m.time.replace('T',' ')}</p><div class="bg-indigo-50 text-indigo-700 px-2.5 py-2 rounded-xl font-bold">소집: ${meetingAudienceLabel(m)||'대상 미지정'}</div>${m.details?`<p class="bg-slate-50 p-2 rounded-lg whitespace-pre-line">${m.details}</p>`:''}${target?`<div class="grid grid-cols-2 gap-2"><button onclick="runBusyAction(this,'참석 저장 중...',()=>handleRSVP(${m.id},'참석'))" class="py-2 rounded-xl font-bold ${my==='참석'?'bg-emerald-600 text-white':'bg-slate-100'}">참석</button><button onclick="runBusyAction(this,'불참 저장 중...',()=>handleRSVP(${m.id},'불참'))" class="py-2 rounded-xl font-bold ${my==='불참'?'bg-rose-600 text-white':'bg-slate-100'}">불참</button></div>`:`<div class="bg-slate-50 p-2 rounded-lg text-slate-500">열람만 가능 · 참석/불참 응답 대상 아님</div>`}${currentUserIsAdmin()?`<div class="bg-slate-50 p-2 rounded-xl"><b>응답</b>${reports||'<p>아직 응답 없음</p>'}</div><div class="flex gap-2"><button onclick="openMeetingForEdit(${m.id})" class="flex-1 py-2 bg-indigo-50 text-indigo-600 rounded-xl font-bold">수정</button><button onclick="runBusyAction(this,'회의 종료 중...',()=>finishMeeting(${m.id}))" class="flex-1 py-2 bg-emerald-100 text-emerald-700 rounded-xl font-bold">회의 종료</button><button onclick="runBusyAction(this,'회의 삭제 중...',()=>deleteMeeting(${m.id}))" class="flex-1 py-2 bg-rose-50 text-rose-600 rounded-xl font-bold">삭제</button></div>`:''}</div>`}).join('');}
 
         async function submitNotice(btn){
             const title=document.getElementById('notice-title').value.trim();
@@ -5267,7 +5320,7 @@
         }
         async function getPushRegistration(){
             if(!('serviceWorker' in navigator)) throw new Error('이 브라우저는 백그라운드 알림을 지원하지 않습니다.');
-            return navigator.serviceWorker.register('./sw.js?v=56',{scope:'./',updateViaCache:'none'});
+            return navigator.serviceWorker.register('./sw.js?v=57',{scope:'./',updateViaCache:'none'});
         }
         // 삼성 인터넷/안드로이드 크롬: 사용자가 버튼을 누른 즉시 권한을 요청해야
         // 비동기 로그인/서비스워커 작업 때문에 사용자 제스처가 소실되는 문제를 줄일 수 있습니다.
@@ -5422,7 +5475,7 @@
                 return false;
             }
         }
-        if('serviceWorker' in navigator) window.addEventListener('load',async()=>{try{const r=await navigator.serviceWorker.register('./sw.js?v=56',{scope:'./',updateViaCache:'none'});await r.update();}catch(e){console.error(e)}});
+        if('serviceWorker' in navigator) window.addEventListener('load',async()=>{try{const r=await navigator.serviceWorker.register('./sw.js?v=57',{scope:'./',updateViaCache:'none'});await r.update();}catch(e){console.error(e)}});
 
         function currentUserIsAdmin(){
             const org=dbCache.orgs.find(o=>o.code===dbCache.currentOrgCode);
